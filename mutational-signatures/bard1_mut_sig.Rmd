@@ -1,0 +1,414 @@
+---
+title: "Mutational Signatures"
+author: "Jo Lynne Rokita"
+date: '2022-2023'
+output: 
+  html_notebook:
+  toc: TRUE
+toc_float: TRUE
+editor_options:
+  chunk_output_type: inline
+---
+
+**Purpose:**
+
+Calculate and plot mutational signatures for all samples using [COSMIC signatures](https://cancer.sanger.ac.uk/cosmic) and 
+[Alexandrov et al, 2013](https://www.ncbi.nlm.nih.gov/pubmed/23945592) mutational signatures. 
+
+
+#### Usage
+
+To run this from the command line, use:
+```
+Rscript -e "rmarkdown::render('mutational-signatures/bard1_mut_sig.Rmd', clean = TRUE)"
+```
+
+_This assumes you are in the top directory of the repository._
+
+## Setup
+
+#### Packages and functions
+
+Import necessary functions.
+
+```{r load packages}
+# load libaries
+suppressPackageStartupMessages({
+library(deconstructSigs)
+library(BSgenome.Hsapiens.UCSC.hg19)
+library(tidyverse)
+library(ComplexHeatmap)
+library(mmsig)
+})
+```
+
+Set up directory paths. 
+
+```{r set directory paths}
+root_dir <- rprojroot::find_root(rprojroot::has_dir(".git"))
+analysis_dir <- file.path(root_dir, "mutational-signatures")
+results_dir <- file.path(analysis_dir, "results")
+plots_dir <- file.path(analysis_dir, "plots")
+input_dir <- file.path(analysis_dir, "input")
+```
+
+Make new directories for the results. 
+
+```{r make diretories}
+if (!dir.exists(results_dir)) {
+  dir.create(results_dir)
+}
+if (!dir.exists(plots_dir)) {
+  dir.create(plots_dir, recursive = TRUE)
+}
+```
+
+## Read in data
+
+Read in the MAF and signature matrices. 
+
+```{r read in data files}
+# filtered maf
+maf_file <- file.path(input_dir, "IMR5-merge.MuTect2.filtered.PASSorClusteredEvents.final.maf")
+# read in file
+maf <- data.table::fread(maf_file, data.table = FALSE) %>%
+  mutate(Tumor_Sample_Barcode = case_when(Tumor_Sample_Barcode == "IMR5-WT" ~ "Control",
+                        Tumor_Sample_Barcode == "IMR5-E287" ~ "E287fs",
+                        Tumor_Sample_Barcode == "IMR5-R112" ~ "R112*",
+                        Tumor_Sample_Barcode == "IMR5-R150" ~ "R150*",
+                        TRUE ~ Tumor_Sample_Barcode))
+
+```
+
+# Create some functions to read in signature matrices
+
+```{r}
+format_file_dsig <- function(input_file) {
+  dsig_file <- read.table(file.path(input_dir, input_file), sep="\t", head=T,
+             stringsAsFactors = F)
+  rownames(dsig_file) <- dsig_file$Type
+  dsig_file$Type <- NULL
+  dsig_file <- as.data.frame(t(as.matrix(dsig_file)))
+  return(dsig_file)
+}
+
+format_file_mmsig <- function(input_file) {
+  mmsig_file <- read.table(file.path(input_dir, input_file), sep="\t", head=T,
+             stringsAsFactors = F)
+  rownames(mmsig_file) <- mmsig_file$Type
+  mmsig_file$Type <- NULL
+return(mmsig_file)
+}
+
+# SBS
+cosmic_sbs_2 <- format_file_dsig("COSMIC_v2_SBS_GRCh37.txt")
+cosmic_sbs_3.2 <- format_file_dsig("COSMIC_v3.2_SBS_GRCh37.txt")
+cosmic_sbs_3.3 <- format_file_dsig("COSMIC_v3.3.1_SBS_GRCh37.txt")
+
+cosmic_sbs_2_orig <- format_file_mmsig("COSMIC_v2_SBS_GRCh37.txt")
+cosmic_sbs_3.2_orig <- format_file_mmsig("COSMIC_v3.2_SBS_GRCh37.txt")
+cosmic_sbs_3.3_orig <- format_file_mmsig("COSMIC_v3.3.1_SBS_GRCh37.txt")
+
+# DBS
+cosmic_dbs_3.2 <- format_file_dsig("COSMIC_v3.2_DBS_GRCh37.txt")
+cosmic_dbs_3.3 <- format_file_dsig("COSMIC_v3.3_DBS_GRCh37.txt")
+```
+
+## Make sigs input
+
+```{r make sigs input}
+# Convert to deconstructSigs input - filtered MAF
+
+# SBS input
+sigs_input_sbs <- mut.to.sigs.input(
+  mut.ref = maf,
+  sample.id = "Tumor_Sample_Barcode",
+  chr = "Chromosome",
+  pos = "Start_Position",
+  ref = "Reference_Allele",
+  alt = "Tumor_Seq_Allele2",
+  bsg = BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19
+)
+
+# DBS input
+sigs_input_dbs <- mut.to.sigs.input(
+  mut.ref = maf,
+  sample.id = "Tumor_Sample_Barcode",
+  chr = "Chromosome",
+  pos = "Start_Position",
+  ref = "Reference_Allele",
+  alt = "Tumor_Seq_Allele2",
+  bsg = BSgenome.Hsapiens.UCSC.hg19::BSgenome.Hsapiens.UCSC.hg19,
+  sig.type = "DBS"
+)
+
+```
+
+## Determine Signatures for COSMIC and Alexandrov et al, 2013
+
+Get list of tumor sample ids. 
+
+```{r get list of sample ids}
+  sample_ids <- maf %>%
+  dplyr::filter(Tumor_Sample_Barcode %in% rownames(sigs_input_sbs)) %>%
+  dplyr::distinct(Tumor_Sample_Barcode) %>%
+  dplyr::pull(Tumor_Sample_Barcode)
+```
+
+
+## Create lists of include/exclude signatures
+Neuroblastoma-specific derived from [Brady, et al 2020](https://www.nature.com/articles/s41467-020-18987-4#:~:text=COSMIC%20mutational%20signature%2018%2C%20previously,is%20continuous%20throughout%20disease%20evolution.)
+
+```{r Set up lists of excluded and included signatures for COSMIC V3}
+map <- read_tsv(file.path(input_dir, "sbs_v3_map.tsv"))
+
+# Excluded signatures:
+artifact_sigs <- map %>%
+  filter(Broad_category == "Sequencing artifact") %>%
+  pull(Signature)
+
+therapy_sigs <- map %>%
+  filter(Broad_category == "Therapy exposure") %>%
+  pull(Signature)
+
+environ_sigs <- map %>%
+  filter(Broad_category == "Environmental exposure") %>%
+  pull(Signature)
+
+unknown <- map %>%
+  filter(Broad_category == "Unknown") %>%
+  pull(Signature)
+
+exclude_sigs <- c(artifact_sigs, therapy_sigs, environ_sigs, "SBS39")
+include_sigs <- setdiff(rownames(cosmic_sbs_3.2), exclude_sigs)
+
+# Neuroblastoma-specific expected signatures minus therapy (SBS31 is cisplatin)
+nbl_sigs <- c("SBS1", "SBS3", "SBS5", "SBS18")
+nbl_exclude <- c(exclude_sigs, unknown)
+
+nbl_include_sigs <- unique(c(setdiff(rownames(cosmic_sbs_3.2), nbl_exclude), nbl_sigs))
+
+
+```
+
+## Run COSMIC V2 and V3.2 Signatures
+Get [COSMIC V2 and V3 signatures](https://cancer.sanger.ac.uk/cosmic) for each sample.
+This step will take some time. 
+
+```{r run COSMIC V2 and V3.2 Signatures}
+# determine the signatures contributing to each samples
+
+cosm_types <- list("v3.2_dbs" = cosmic_dbs_3.2, "v2_sbs" = cosmic_sbs_2, "v3.2_sbs_nbl" = cosmic_sbs_3.2, "v3.2_sbs_39" = cosmic_sbs_3.2)
+
+  for (sig_type in names(cosm_types)) {
+  
+    # Convert to deconstructSigs input - filtered
+    
+    if (sig_type == "v3.2_dbs"){
+      sigs_input <- sigs_input_dbs
+      normalization <- "default"
+      sig_list <- rownames(cosmic_dbs_3.2)
+    }
+    
+    else if (sig_type == "v2_sbs"){
+      sigs_input <- sigs_input_sbs
+      normalization <- "genome"
+      sig_list <- rownames(cosmic_sbs_2)
+    }
+
+    else if (sig_type == "v3.2_sbs_nbl"){
+      sigs_input <- sigs_input_sbs
+      normalization <- "genome"
+      sig_list <- nbl_include_sigs
+    }
+    
+    else if (sig_type == "v3.2_sbs_39"){
+      sigs_input <- sigs_input_sbs
+      normalization <- "genome"
+      sig_list <- include_sigs
+      }
+    
+    
+    cosmic_weights = data.frame()
+    for (each in sample_ids) {
+  
+  sig_result = whichSignatures(tumor.ref = sigs_input, 
+                         signatures.ref = cosm_types[[sig_type]],
+                         sample.id = each, 
+                         contexts.needed = TRUE, 
+                         associated = sig_list,
+                         tri.counts.method = normalization,
+                         #signature.cutoff = 0.06
+                         )
+
+  weights_df <- as.data.frame(sig_result$weights)
+  weights_df$Line <- rownames(weights_df)
+  # add vector to a dataframe
+  cosmic_weights <- rbind(cosmic_weights, weights_df)
+    }
+
+  # remove underscore for plotting
+  names(cosmic_weights) <- gsub("_", " ", names(cosmic_weights), fixed = TRUE)
+  cosmic_weights_mod <- cosmic_weights %>%
+    arrange(Line) %>%
+  select(Line, 1:ncol(cosmic_weights)-1) %>%
+  write_tsv(paste(results_dir, "/", sig_type, "-signature-exposures.tsv", sep = ""))
+  print(sig_type)
+  print(cosmic_weights_mod)
+
+  
+### COSMIC
+# create matrix
+sigs <- cosmic_weights_mod
+rownames(sigs) <- paste0(sigs$Line)
+sigs$Line <- NULL
+# remove if colSums = 0 & unknown sig
+sigs <- sigs %>% 
+  select_if(function(col) is.numeric(col) && sum(col) > 0)
+sigs <- as.matrix(sigs)
+  
+  # Make heatmap without legends
+  heat_plot <- Heatmap(sigs, 
+                       col = colorRampPalette(c("whitesmoke", "navy"), bias = 2)(50),
+                       cluster_rows = FALSE,
+                       show_row_names = TRUE,
+                       show_heatmap_legend=FALSE,
+                       cluster_columns = FALSE,
+                       #right_annotation = row_anno,
+                       rect_gp = gpar(col = "white"),
+                       row_title = NULL, 
+                       column_title = paste("COSMIC ", sig_type, " Mutational Signature Weights"),
+                       column_title_side = "bottom")
+  print(heat_plot)
+
+  # Also create stacked plot
+sig_names <- colnames(sigs)
+sigs_df <- as.data.frame(sigs)
+sigs_df$Line <- rownames(sigs_df)
+
+# make long df
+sigs_df_long <- sigs_df %>% pivot_longer(cols=all_of(sig_names),
+                    names_to='Signature',
+                    values_to='Exposure') 
+
+stacked_plot <- ggplot(sigs_df_long, aes(fill=Signature, y=Exposure, x=Line)) + 
+  geom_col(position = "fill") +
+  scale_fill_brewer(palette="Set3") +
+  xlab("Cell Line") +
+  ylab("Mutational Signature Weights") +
+  theme_classic()
+
+print(stacked_plot)
+
+
+dev.set(dev.next())
+# save heatmap 
+  pdf(file.path(paste(plots_dir, "/cosmic_", sig_type, "_sigs.pdf", sep = "")), width = 6, height = 4)
+  print(heat_plot)
+  print(stacked_plot)
+  dev.off()
+  
+  }
+
+
+```
+
+
+
+## Create Nature Sig Input
+Get [Alexandrov et al, 2013](https://www.ncbi.nlm.nih.gov/pubmed/23945592) signatures for each sample.
+
+```{r Create NATURE sig input}
+# determine the signatures contributing to each samples
+nature_weights = data.frame()
+
+for (each in sample_ids) {
+  
+  nat_sig_result = whichSignatures(tumor.ref = sigs_input, 
+                         signatures.ref = signatures.nature2013,
+                         sample.id = each, 
+                         contexts.needed = TRUE,
+                         tri.counts.method = "genome",
+                         signature.cutoff = 0.06)
+
+  nat_weights_df <- as.data.frame(nat_sig_result$weights)
+  nat_weights_df$Line <- rownames(nat_weights_df)
+  # add unknown contributions
+  nat_weights_df$Unknown <- nat_weights_df$unknown
+  # add vector to a dataframe
+  nature_weights <- rbind(nature_weights, nat_weights_df)
+}
+
+# remove period for plotting
+names(nature_weights) <- gsub(".", " ", names(nature_weights), fixed = TRUE)
+nature_weights_mod <- nature_weights %>%
+    arrange(Line) %>%
+  select(Line, 1:ncol(nature_weights)-1) %>%
+write_tsv(paste(results_dir, "/nature-signature-exposures.tsv", sep = ""))
+nature_weights_mod
+```
+
+## Nature signatures
+```{r Get Nature signatures}
+### NATURE
+# create matrix
+sigs <- nature_weights_mod
+rownames(sigs) <- paste0(sigs$Line)
+sigs$Line <- NULL
+# remove if colSums = 0 and remove unknown sig
+sigs <- sigs %>% 
+  select_if(function(col) is.numeric(col) && sum(col) > 0)
+sigs <- as.matrix(sigs)
+  
+  # Make heatmap without legends
+  heat_plot <- Heatmap(sigs, 
+                       col = colorRampPalette(c("whitesmoke", "navy"), bias = 2)(50),
+                       cluster_rows = FALSE,
+                       show_row_names = TRUE,
+                       show_heatmap_legend=FALSE,
+                       cluster_columns = FALSE,
+                       #right_annotation = row_anno,
+                       rect_gp = gpar(col = "white"),
+                       row_title = NULL, 
+                       column_title = "Nature Mutational Signature Weights", 
+                       column_title_side = "bottom")
+  
+  heat_plot
+
+  # Also create stacked plot
+sig_names <- colnames(sigs)
+sigs_df <- as.data.frame(sigs)
+sigs_df$Line <- rownames(sigs_df)
+
+# make long df
+sigs_df_long <- sigs_df %>% pivot_longer(cols=sig_names,
+                    names_to='Signature',
+                    values_to='Exposure') 
+
+# reorder levels so that signature 3 is on the bottom
+sigs_df_long$Signature <- factor(sigs_df_long$Signature, levels = c("Signature 1A", "Signature 1B", "Signature 3", "Signature 4", "Signature 6", "Signature 7", "Signature 9", "Signature 10", "Signature 15", "Signature U1"))
+
+stacked_plot <- ggplot(sigs_df_long, aes(fill=Signature, y=Exposure, x=Line)) + 
+  geom_col(position = "fill") +
+  scale_fill_brewer(palette="Set3") +
+  xlab("Cell Line") +
+  ylab("Nature Mutational Signature Weights") +
+  theme_classic()
+
+stacked_plot
+
+dev.set(dev.next())
+# save heatmap 
+  pdf(file.path(plots_dir, "nature_sigs.pdf"), width = 6, height = 4)
+  print(heat_plot)
+  print(stacked_plot)
+  dev.off()
+
+```
+
+
+## Session Info
+
+```{r}
+sessionInfo()
+```
